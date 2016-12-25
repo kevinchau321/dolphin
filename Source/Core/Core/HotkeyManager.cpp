@@ -45,7 +45,8 @@ const std::string hotkey_labels[] = {
     _trans("Connect Wii Remote 4"),
     _trans("Connect Balance Board"),
 
-    _trans("Toggle EFBAccessEnable"),
+    _trans("Toggle Crop"),
+    _trans("Toggle EFB Access Enable"),
     _trans("Toggle Aspect Ratio"),
     _trans("Toggle EFB Copies"),
     _trans("Toggle Fog"),

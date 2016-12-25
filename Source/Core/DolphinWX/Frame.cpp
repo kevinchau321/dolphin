@@ -1316,6 +1316,10 @@ void CFrame::ParseHotkeys()
   }
   if (IsHotkey(HK_TOGGLE_CROP))
   {
+    g_Config.bCrop = !g_Config.bCrop;
+  }
+  if (IsHotkey(HK_TOGGLE_EFBEnableAccess))
+  {
     g_Config.bEFBAccessEnable = !g_Config.bEFBAccessEnable;
   }
   if (IsHotkey(HK_TOGGLE_AR))
