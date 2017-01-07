@@ -40,8 +40,6 @@ static const int TEXTURE_KILL_THRESHOLD =
     64;  // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
 static const int TEXTURE_POOL_KILL_THRESHOLD = 3;
 static const int FRAMECOUNT_INVALID = 0;
-static const u64 MAX_TEXTURE_BINARY_SIZE =
-    1024 * 1024 * 4;  // 1024 x 1024 texel times 8 nibbles per texel
 
 std::unique_ptr<TextureCacheBase> g_texture_cache;
 
@@ -133,8 +131,8 @@ void TextureCacheBase::OnConfigChanged(VideoConfig& config)
 
 void TextureCacheBase::Cleanup(int _frameCount)
 {
-  TexCache::iterator iter = textures_by_address.begin();
-  TexCache::iterator tcend = textures_by_address.end();
+  TexAddrCache::iterator iter = textures_by_address.begin();
+  TexAddrCache::iterator tcend = textures_by_address.end();
   while (iter != tcend)
   {
     if (iter->second->frameCount == FRAMECOUNT_INVALID)
@@ -294,9 +292,16 @@ void TextureCacheBase::ScaleTextureCacheEntryTo(TextureCacheBase::TCacheEntryBas
 }
 
 TextureCacheBase::TCacheEntryBase*
-TextureCacheBase::DoPartialTextureUpdates(TexCache::iterator iter_t, u8* palette, u32 tlutfmt)
+TextureCacheBase::DoPartialTextureUpdates(TCacheEntryBase* entry_to_update, u8* palette,
+                                          u32 tlutfmt)
 {
-  TCacheEntryBase* entry_to_update = iter_t->second;
+  // If the flag may_have_overlapping_textures is cleared, there are no overlapping EFB copies,
+  // which aren't applied already. It is set for new textures, and for the affected range
+  // on each EFB copy.
+  if (!entry_to_update->may_have_overlapping_textures)
+    return entry_to_update;
+  entry_to_update->may_have_overlapping_textures = false;
+
   const bool isPaletteTexture =
       (entry_to_update->format == GX_TF_C4 || entry_to_update->format == GX_TF_C8 ||
        entry_to_update->format == GX_TF_C14X2 || entry_to_update->format >= 0x10000);
@@ -313,15 +318,10 @@ TextureCacheBase::DoPartialTextureUpdates(TexCache::iterator iter_t, u8* palette
 
   u32 numBlocksX = (entry_to_update->native_width + block_width - 1) / block_width;
 
-  TexCache::iterator iter =
-      textures_by_address.lower_bound(entry_to_update->addr > MAX_TEXTURE_BINARY_SIZE ?
-                                          entry_to_update->addr - MAX_TEXTURE_BINARY_SIZE :
-                                          0);
-  TexCache::iterator iterend =
-      textures_by_address.upper_bound(entry_to_update->addr + entry_to_update->size_in_bytes);
-  while (iter != iterend)
+  auto iter = FindOverlappingTextures(entry_to_update->addr, entry_to_update->size_in_bytes);
+  while (iter.first != iter.second)
   {
-    TCacheEntryBase* entry = iter->second;
+    TCacheEntryBase* entry = iter.first->second;
     if (entry != entry_to_update && entry->IsEfbCopy() &&
         entry->references.count(entry_to_update) == 0 &&
         entry->OverlapsMemoryRange(entry_to_update->addr, entry_to_update->size_in_bytes) &&
@@ -343,7 +343,7 @@ TextureCacheBase::DoPartialTextureUpdates(TexCache::iterator iter_t, u8* palette
           }
           else
           {
-            ++iter;
+            ++iter.first;
             continue;
           }
         }
@@ -426,11 +426,11 @@ TextureCacheBase::DoPartialTextureUpdates(TexCache::iterator iter_t, u8* palette
       else
       {
         // If the hash does not match, this EFB copy will not be used for anything, so remove it
-        iter = InvalidateTexture(iter);
+        iter.first = InvalidateTexture(iter.first);
         continue;
       }
     }
-    ++iter;
+    ++iter.first;
   }
   return entry_to_update;
 }
@@ -617,12 +617,11 @@ TextureCacheBase::TCacheEntryBase* TextureCacheBase::Load(const u32 stage)
   // For efb copies, the entry created in CopyRenderTargetToTexture always has to be used, or else
   // it was
   // done in vain.
-  std::pair<TexCache::iterator, TexCache::iterator> iter_range =
-      textures_by_address.equal_range((u64)address);
-  TexCache::iterator iter = iter_range.first;
-  TexCache::iterator oldest_entry = iter;
+  auto iter_range = textures_by_address.equal_range(address);
+  TexAddrCache::iterator iter = iter_range.first;
+  TexAddrCache::iterator oldest_entry = iter;
   int temp_frameCount = 0x7fffffff;
-  TexCache::iterator unconverted_copy = textures_by_address.end();
+  TexAddrCache::iterator unconverted_copy = textures_by_address.end();
 
   while (iter != iter_range.second)
   {
@@ -667,7 +666,7 @@ TextureCacheBase::TCacheEntryBase* TextureCacheBase::Load(const u32 stage)
           entry->native_levels >= tex_levels && entry->native_width == nativeW &&
           entry->native_height == nativeH)
       {
-        entry = DoPartialTextureUpdates(iter, &texMem[tlutaddr], tlutfmt);
+        entry = DoPartialTextureUpdates(iter->second, &texMem[tlutaddr], tlutfmt);
 
         return ReturnEntry(stage, entry);
       }
@@ -708,20 +707,20 @@ TextureCacheBase::TCacheEntryBase* TextureCacheBase::Load(const u32 stage)
       std::max(texture_size, palette_size) <=
           (u32)g_ActiveConfig.iSafeTextureCache_ColorSamples * 8)
   {
-    iter_range = textures_by_hash.equal_range(full_hash);
-    iter = iter_range.first;
-    while (iter != iter_range.second)
+    auto hash_range = textures_by_hash.equal_range(full_hash);
+    TexHashCache::iterator hash_iter = hash_range.first;
+    while (hash_iter != hash_range.second)
     {
-      TCacheEntryBase* entry = iter->second;
+      TCacheEntryBase* entry = hash_iter->second;
       // All parameters, except the address, need to match here
       if (entry->format == full_format && entry->native_levels >= tex_levels &&
           entry->native_width == nativeW && entry->native_height == nativeH)
       {
-        entry = DoPartialTextureUpdates(iter, &texMem[tlutaddr], tlutfmt);
+        entry = DoPartialTextureUpdates(hash_iter->second, &texMem[tlutaddr], tlutfmt);
 
         return ReturnEntry(stage, entry);
       }
-      ++iter;
+      ++hash_iter;
     }
   }
 
@@ -784,7 +783,7 @@ TextureCacheBase::TCacheEntryBase* TextureCacheBase::Load(const u32 stage)
     }
   }
 
-  iter = textures_by_address.emplace((u64)address, entry);
+  iter = textures_by_address.emplace(address, entry);
   if (g_ActiveConfig.iSafeTextureCache_ColorSamples == 0 ||
       std::max(texture_size, palette_size) <=
           (u32)g_ActiveConfig.iSafeTextureCache_ColorSamples * 8)
@@ -857,15 +856,14 @@ TextureCacheBase::TCacheEntryBase* TextureCacheBase::Load(const u32 stage)
   INCSTAT(stats.numTexturesUploaded);
   SETSTAT(stats.numTexturesAlive, textures_by_address.size());
 
-  entry = DoPartialTextureUpdates(iter, &texMem[tlutaddr], tlutfmt);
+  entry = DoPartialTextureUpdates(iter->second, &texMem[tlutaddr], tlutfmt);
 
   return ReturnEntry(stage, entry);
 }
 
 void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFormat, u32 dstStride,
-                                                 PEControl::PixelFormat srcFormat,
-                                                 const EFBRectangle& srcRect, bool isIntensity,
-                                                 bool scaleByHalf)
+                                                 bool is_depth_copy, const EFBRectangle& srcRect,
+                                                 bool isIntensity, bool scaleByHalf)
 {
   // Emulation methods:
   //
@@ -937,7 +935,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFo
   unsigned int cbufid = -1;
   bool efbHasAlpha = bpmem.zcontrol.pixel_format == PEControl::RGBA6_Z24;
 
-  if (srcFormat == PEControl::Z24)
+  if (is_depth_copy)
   {
     switch (dstFormat)
     {
@@ -1210,9 +1208,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFo
   //   updated textures, which forces that partially updated texture to be updated.
   // TODO: This also wipes out non-efb copies, which is counterproductive.
   {
-    std::pair<TexCache::iterator, TexCache::iterator> iter_range =
-        textures_by_address.equal_range((u64)dstAddr);
-    TexCache::iterator iter = iter_range.first;
+    auto iter_range = textures_by_address.equal_range(dstAddr);
+    TexAddrCache::iterator iter = iter_range.first;
     while (iter != iter_range.second)
     {
       iter = InvalidateTexture(iter);
@@ -1235,14 +1232,15 @@ void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFo
   // RGBA takes two cache lines per block; all others take one
   const u32 bytes_per_block = baseFormat == GX_TF_RGBA8 ? 64 : 32;
 
-  u32 bytes_per_row = num_blocks_x * bytes_per_block;
+  const u32 bytes_per_row = num_blocks_x * bytes_per_block;
+  const u32 covered_range = num_blocks_y * dstStride;
 
   bool copy_to_ram = !g_ActiveConfig.bSkipEFBCopyToRam;
   bool copy_to_vram = true;
 
   if (copy_to_ram)
   {
-    CopyEFB(dst, dstFormat, tex_w, bytes_per_row, num_blocks_y, dstStride, srcFormat, srcRect,
+    CopyEFB(dst, dstFormat, tex_w, bytes_per_row, num_blocks_y, dstStride, is_depth_copy, srcRect,
             isIntensity, scaleByHalf);
   }
   else
@@ -1286,21 +1284,24 @@ void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFo
   }
 
   // Invalidate all textures that overlap the range of our efb copy.
-  // Unless our efb copy has a weird stride, then we want avoid invalidating textures which
-  // we might be able to do a partial texture update on.
+  // Unless our efb copy has a weird stride, then we mark them to check for partial texture updates.
   // TODO: This also invalidates partial overlaps, which we currently don't have a better way
   //       of dealing with.
-  if (dstStride == bytes_per_row || !copy_to_vram)
+  bool invalidate_textures = dstStride == bytes_per_row || !copy_to_vram;
+  auto iter = FindOverlappingTextures(dstAddr, covered_range);
+  while (iter.first != iter.second)
   {
-    TexCache::iterator iter = textures_by_address.begin();
-    while (iter != textures_by_address.end())
+    TCacheEntryBase* entry = iter.first->second;
+    if (entry->OverlapsMemoryRange(dstAddr, covered_range))
     {
-      if (iter->second->addr + iter->second->size_in_bytes <= dstAddr ||
-          iter->second->addr >= dstAddr + num_blocks_y * dstStride)
-        ++iter;
-      else
-        iter = InvalidateTexture(iter);
+      if (invalidate_textures)
+      {
+        iter.first = InvalidateTexture(iter.first);
+        continue;
+      }
+      entry->may_have_overlapping_textures = true;
     }
+    ++iter.first;
   }
 
   if (copy_to_vram)
@@ -1323,7 +1324,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFo
       entry->SetEfbCopy(dstStride);
       entry->is_custom_tex = false;
 
-      entry->FromRenderTarget(dst, srcFormat, srcRect, scaleByHalf, cbufid, colmat);
+      entry->FromRenderTarget(is_depth_copy, srcRect, scaleByHalf, cbufid, colmat);
 
       u64 hash = entry->CalculateHash();
       entry->SetHashes(hash, hash);
@@ -1336,7 +1337,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(u32 dstAddr, unsigned int dstFo
                     0);
       }
 
-      textures_by_address.emplace((u64)dstAddr, entry);
+      textures_by_address.emplace(dstAddr, entry);
     }
   }
 }
@@ -1361,6 +1362,7 @@ TextureCacheBase::AllocateTexture(const TCacheEntryConfig& config)
   }
 
   entry->textures_by_hash_iter = textures_by_hash.end();
+  entry->may_have_overlapping_textures = true;
   return entry;
 }
 
@@ -1377,12 +1379,11 @@ TextureCacheBase::FindMatchingTextureFromPool(const TCacheEntryConfig& config)
   return matching_iter != range.second ? matching_iter : texture_pool.end();
 }
 
-TextureCacheBase::TexCache::iterator
+TextureCacheBase::TexAddrCache::iterator
 TextureCacheBase::GetTexCacheIter(TextureCacheBase::TCacheEntryBase* entry)
 {
-  std::pair<TexCache::iterator, TexCache::iterator> iter_range =
-      textures_by_address.equal_range(entry->addr);
-  TexCache::iterator iter = iter_range.first;
+  auto iter_range = textures_by_address.equal_range(entry->addr);
+  TexAddrCache::iterator iter = iter_range.first;
   while (iter != iter_range.second)
   {
     if (iter->second == entry)
@@ -1394,7 +1395,25 @@ TextureCacheBase::GetTexCacheIter(TextureCacheBase::TCacheEntryBase* entry)
   return textures_by_address.end();
 }
 
-TextureCacheBase::TexCache::iterator TextureCacheBase::InvalidateTexture(TexCache::iterator iter)
+std::pair<TextureCacheBase::TexAddrCache::iterator, TextureCacheBase::TexAddrCache::iterator>
+TextureCacheBase::FindOverlappingTextures(u32 addr, u32 size_in_bytes)
+{
+  // We index by the starting address only, so there is no way to query all textures
+  // which end after the given addr. But the GC textures have a limited size, so we
+  // look for all textures which have a start address bigger than addr minus the maximal
+  // texture size. But this yields false-positives which must be checked later on.
+
+  // 1024 x 1024 texel times 8 nibbles per texel
+  constexpr u32 max_texture_size = 1024 * 1024 * 4;
+  u32 lower_addr = addr > max_texture_size ? addr - max_texture_size : 0;
+  auto begin = textures_by_address.lower_bound(lower_addr);
+  auto end = textures_by_address.upper_bound(addr + size_in_bytes);
+
+  return std::make_pair(begin, end);
+}
+
+TextureCacheBase::TexAddrCache::iterator
+TextureCacheBase::InvalidateTexture(TexAddrCache::iterator iter)
 {
   if (iter == textures_by_address.end())
     return textures_by_address.end();
